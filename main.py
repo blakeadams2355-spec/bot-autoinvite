@@ -35,7 +35,12 @@ async def main() -> None:
     for r in get_routers():
         dp.include_router(r)
 
-    timezone = ZoneInfo(TIMEZONE)
+    try:
+        timezone = ZoneInfo(TIMEZONE)
+    except Exception:
+        logger.warning("Invalid TIMEZONE '%s', falling back to UTC", TIMEZONE)
+        timezone = ZoneInfo("UTC")
+
     scheduler = AsyncIOScheduler(timezone=timezone)
     scheduler.start()
 

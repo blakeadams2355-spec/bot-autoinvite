@@ -692,10 +692,12 @@ async def show_statistics(callback_query: CallbackQuery) -> None:
         "all": "всё время",
     }.get(period, period)
 
+    from utils.helpers import format_number
+
     text = (
         f"📊 Статистика за {period_name}:\n"
-        f"Принято: {approved} ✅\n"
-        f"Отклонено: {rejected} ❌"
+        f"Принято: {format_number(approved)} ✅\n"
+        f"Отклонено: {format_number(rejected)} ❌"
     )
 
     await _safe_edit(callback_query, text, reply_markup=get_statistics_menu(channel_id))

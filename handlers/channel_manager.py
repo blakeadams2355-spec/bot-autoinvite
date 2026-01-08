@@ -6,11 +6,14 @@ from typing import List
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
+    Chat,
     ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
 )
 
 from database.operations import (
@@ -27,6 +30,35 @@ from utils.permissions import can_manage_channel
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+
+class AddChannelStates(StatesGroup):
+    waiting_forward = State()
+
+
+async def _remember_menu_message(callback_query: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(menu_chat_id=callback_query.message.chat.id, menu_message_id=callback_query.message.message_id)
+
+
+async def _edit_menu_from_state(
+    bot: Bot,
+    state: FSMContext,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> bool:
+    data = await state.get_data()
+    chat_id = data.get("menu_chat_id")
+    message_id = data.get("menu_message_id")
+    if not chat_id or not message_id:
+        return False
+
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
+        return True
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            logger.warning("Failed to edit menu message: %s", e)
+        return False
 
 
 def _append_back_to_main(markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
@@ -55,32 +87,44 @@ async def validate_channel_permissions(bot: Bot, channel_id: int) -> bool:
 
 async def handle_add_channel(callback_query: CallbackQuery, bot: Bot, state: FSMContext) -> None:
     await state.clear()
+    await _remember_menu_message(callback_query, state)
     await state.update_data(list_mode="add", page=0)
 
     channels = await get_managed_channels(bot, callback_query.from_user.id)
 
     if not channels:
+        await state.set_state(AddChannelStates.waiting_forward)
+
         text = (
             "➕ Добавление канала\n\n"
-            "Чтобы я мог принимать заявки, сначала добавьте меня в канал и выдайте админские права:\n"
+            "Telegram не дает боту список ваших каналов напрямую, поэтому я показываю только те каналы, "
+            "которые успел обнаружить.\n\n"
+            "Если список пуст — просто перешлите сюда любой пост из нужного канала.\n\n"
+            "Перед этим убедитесь, что бот добавлен в канал и ему выданы права:\n"
             "• Приглашать пользователей\n"
-            "• Банить/ограничивать пользователей\n\n"
-            "После этого снова нажмите «Добавить канал»."
+            "• Банить/ограничивать пользователей\n"
         )
+
         markup = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="add_channel")],
+                [InlineKeyboardButton(text="🔄 Обновить список", callback_data="add_channel")],
                 [InlineKeyboardButton(text="← Назад", callback_data="back_main")],
             ]
         )
+
         try:
             await callback_query.message.edit_text(text, reply_markup=markup)
         except TelegramBadRequest:
             pass
+
         await callback_query.answer()
         return
 
-    markup = _append_back_to_main(paginate_channels(channels, page=0, per_page=5))
+    markup = paginate_channels(channels, page=0, per_page=5)
+    markup.inline_keyboard.append(
+        [InlineKeyboardButton(text="📩 Канал не в списке (переслать пост)", callback_data="add_channel_forward")]
+    )
+    markup = _append_back_to_main(markup)
 
     try:
         await callback_query.message.edit_text(
@@ -129,6 +173,97 @@ async def show_user_channels(callback_query: CallbackQuery, bot: Bot, state: FSM
     await callback_query.answer()
 
 
+@router.callback_query(F.data == "add_channel_forward")
+async def add_channel_forward(callback_query: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await _remember_menu_message(callback_query, state)
+    await state.set_state(AddChannelStates.waiting_forward)
+
+    text = (
+        "📩 Добавление канала через пересланный пост\n\n"
+        "Перешлите сюда любой пост из нужного канала.\n\n"
+        "Важно: бот должен быть администратором канала и иметь права:\n"
+        "• Приглашать пользователей\n"
+        "• Банить/ограничивать пользователей\n"
+    )
+
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="← Назад", callback_data="add_channel")]]
+    )
+
+    try:
+        await callback_query.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest:
+        pass
+
+    await callback_query.answer()
+
+
+def _extract_forwarded_chat(message: Message) -> Chat | None:
+    if message.forward_from_chat:
+        return message.forward_from_chat
+
+    origin = getattr(message, "forward_origin", None)
+    chat = getattr(origin, "chat", None) if origin else None
+    return chat
+
+
+@router.message(AddChannelStates.waiting_forward)
+async def add_channel_from_forward(message: Message, state: FSMContext, bot: Bot) -> None:
+    forwarded_chat = _extract_forwarded_chat(message)
+
+    if not forwarded_chat or forwarded_chat.type != "channel":
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="← Назад", callback_data="add_channel")]]
+        )
+        await _edit_menu_from_state(
+            bot,
+            state,
+            "⚠️ Я не вижу, что это пересланный пост из канала. Перешлите сюда пост именно из канала.",
+            reply_markup=markup,
+        )
+        return
+
+    channel_id = forwarded_chat.id
+
+    has_rights = await validate_channel_permissions(bot, channel_id)
+    if not has_rights:
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="← Назад", callback_data="add_channel")]]
+        )
+        await _edit_menu_from_state(
+            bot,
+            state,
+            "❌ У бота недостаточно прав в этом канале.\n\n"
+            "Выдайте права: приглашать пользователей и банить/ограничивать пользователей.",
+            reply_markup=markup,
+        )
+        return
+
+    try:
+        chat_info = await bot.get_chat(channel_id)
+        channel_name = chat_info.username or ""
+        channel_title = chat_info.title or ""
+    except Exception:
+        channel_name = forwarded_chat.username or ""
+        channel_title = forwarded_chat.title or ""
+
+    ok = await add_channel(channel_id, channel_name, channel_title, message.from_user.id)
+    if not ok:
+        await _edit_menu_from_state(bot, state, "⚠️ Не удалось сохранить канал. Попробуйте еще раз.")
+        return
+
+    data = await state.get_data()
+    menu_chat_id = data.get("menu_chat_id")
+    menu_message_id = data.get("menu_message_id")
+    await state.clear()
+
+    if not menu_chat_id or not menu_message_id:
+        return
+
+    await show_channel_menu_message(bot, int(menu_chat_id), int(menu_message_id), channel_id)
+
+
 @router.callback_query(F.data.startswith("channels_page:"))
 async def handle_channels_page(callback_query: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
@@ -143,6 +278,12 @@ async def handle_channels_page(callback_query: CallbackQuery, state: FSMContext)
     if list_mode == "add":
         channels = await get_managed_channels(callback_query.bot, callback_query.from_user.id)
         title = "Выберите канал из списка (это каналы, где бот уже администратор):"
+
+        markup = paginate_channels(channels, page=page, per_page=5)
+        markup.inline_keyboard.append(
+            [InlineKeyboardButton(text="📩 Канал не в списке (переслать пост)", callback_data="add_channel_forward")]
+        )
+        markup = _append_back_to_main(markup)
     else:
         channels = [
             c
@@ -151,7 +292,7 @@ async def handle_channels_page(callback_query: CallbackQuery, state: FSMContext)
         ]
         title = "⚙️ Настройки\n\nВыберите канал:"
 
-    markup = _append_back_to_main(paginate_channels(channels, page=page, per_page=5))
+        markup = _append_back_to_main(paginate_channels(channels, page=page, per_page=5))
 
     try:
         await callback_query.message.edit_text(title, reply_markup=markup)
@@ -241,6 +382,29 @@ async def show_channel_menu(callback_query: CallbackQuery, channel_id: int) -> N
         await callback_query.message.edit_text(text, reply_markup=markup)
     except TelegramBadRequest:
         pass
+
+
+async def show_channel_menu_message(bot: Bot, chat_id: int, message_id: int, channel_id: int) -> None:
+    ch = await get_channel_by_id(channel_id)
+    if not ch:
+        return
+
+    title = ch.get("channel_title") or ch.get("channel_name") or str(channel_id)
+    auto_approve = bool(ch.get("auto_approve"))
+
+    text = (
+        f"📣 Канал: {title}\n"
+        f"ID: {channel_id}\n"
+        f"Автопринятие: {'ВКЛ' if auto_approve else 'ВЫКЛ'}"
+    )
+
+    markup = get_channel_menu(title, auto_approve, channel_id)
+
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            logger.warning("Failed to edit channel menu message: %s", e)
 
 
 @router.callback_query(F.data.startswith("channel_menu:"))

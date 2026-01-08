@@ -24,4 +24,5 @@ venv/
 *.db
 
 # Logs
+logs/
 *.log
